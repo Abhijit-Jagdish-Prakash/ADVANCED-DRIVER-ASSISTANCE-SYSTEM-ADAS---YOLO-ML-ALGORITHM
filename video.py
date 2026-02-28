@@ -123,7 +123,7 @@ def process_video():
     model = YOLO('weights/yolov8n.pt')
 
     # Open the video file
-    cap = cv2.VideoCapture('car.mp4')
+    cap = cv2.VideoCapture('video/car.mp4')
 
     # Check if video opened successfully
     if not cap.isOpened():
