@@ -1,235 +1,144 @@
 import cv2
 import numpy as np
-import math
-import time
-from ultralytics import YOLO  # YOLOv8 module
+from ultralytics import YOLO
 
-# Function to mask out the region of interest
-def region_of_interest(img, vertices):
+# --- Configuration ---
+WIDTH, HEIGHT = 1280, 720
+LANE_ALPHA = 0.15 
+COLLISION_DIST_THRESHOLD = 12.0 # Meters
+
+class LaneState:
+    def __init__(self):
+        self.last_left = [300, HEIGHT, 580, 450]
+        self.last_right = [1000, HEIGHT, 700, 450]
+
+    def smooth_step(self, new_coords, is_left=True):
+        old_coords = self.last_left if is_left else self.last_right
+        smoothed = [int(LANE_ALPHA * n + (1 - LANE_ALPHA) * o) for n, o in zip(new_coords, old_coords)]
+        if is_left: self.last_left = smoothed
+        else: self.last_right = smoothed
+        return smoothed
+
+lane_memory = LaneState()
+
+def get_lane_bounds(y, line):
+    x1, y1, x2, y2 = line
+    if y2 == y1: return x1
+    return x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+
+def region_of_interest(img):
     mask = np.zeros_like(img)
-    match_mask_color = 255
-    cv2.fillPoly(mask, vertices, match_mask_color)
-    masked_image = cv2.bitwise_and(img, mask)
-    return masked_image
+    vertices = np.array([[(50, HEIGHT), (WIDTH//2 - 100, 450), (WIDTH//2 + 100, 450), (WIDTH-50, HEIGHT)]], dtype=np.int32)
+    cv2.fillPoly(mask, vertices, 255)
+    return cv2.bitwise_and(img, mask)
 
-# Function to draw the filled polygon between the lane lines
-def draw_lane_lines(img, left_line, right_line, color=[0, 255, 0], thickness=10):
-    line_img = np.zeros_like(img)
-    poly_pts = np.array([[
-        (left_line[0], left_line[1]),
-        (left_line[2], left_line[3]),
-        (right_line[2], right_line[3]),
-        (right_line[0], right_line[1])
-    ]], dtype=np.int32)
+def preprocess_for_weather(img):
+    """Enhances visibility for fog and rain conditions."""
+    # 1. Convert to HLS to isolate yellow/white lanes better than Grayscale
+    hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+    l_channel = hls[:,:,1]
     
-    # Fill the polygon between the lines
-    cv2.fillPoly(line_img, poly_pts, color)
+    # 2. Apply CLAHE to the L (Lightness) channel to 'see' through fog
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    enhanced_l = clahe.apply(l_channel)
     
-    # Overlay the polygon onto the original image
-    img = cv2.addWeighted(img, 0.8, line_img, 0.5, 0.0)
-    return img
+    # 3. Bilateral Filter: Smooths rain noise while keeping lane edges sharp
+    blurred = cv2.bilateralFilter(enhanced_l, 9, 75, 75)
+    
+    # 4. Adaptive Canny
+    v = np.median(blurred)
+    lower = int(max(0, (1.0 - 0.33) * v))
+    upper = int(min(255, (1.0 + 0.33) * v))
+    canny = cv2.Canny(blurred, lower, upper)
+    
+    return canny
 
-# --- NEW FEATURE: Traffic Light State Detection ---
-def detect_traffic_light_state(frame, box):
-    x1, y1, x2, y2 = box
-    roi = frame[y1:y2, x1:x2]
-    if roi.size == 0: return "UNKNOWN", (255, 255, 255)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    # Red mask
-    lower_red = np.array([0, 70, 50]); upper_red = np.array([10, 255, 255])
-    mask_r = cv2.inRange(hsv, lower_red, upper_red)
-    # Green mask
-    lower_green = np.array([40, 70, 50]); upper_green = np.array([90, 255, 255])
-    mask_g = cv2.inRange(hsv, lower_green, upper_green)
-    if np.sum(mask_r) > np.sum(mask_g): return "STOP", (0, 0, 255)
-    else: return "GO", (0, 255, 0)
+def draw_lane_overlay(img, left_line, right_line, is_danger):
+    overlay = img.copy()
+    pts = np.array([[(left_line[0], left_line[1]), (left_line[2], left_line[3]),
+                     (right_line[2], right_line[3]), (right_line[0], right_line[1])]], dtype=np.int32)
+    color = (0, 0, 255) if is_danger else (0, 255, 0)
+    cv2.fillPoly(overlay, pts, color)
+    return cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
 
-# The lane detection pipeline
 def pipeline(image):
-    height = image.shape[0]
-    width = image.shape[1]
-    region_of_interest_vertices = [
-        (0, height),
-        (width / 2, height / 2),
-        (width, height),
-    ]
+    # Process image with weather-resistant enhancements
+    canny = preprocess_for_weather(image)
+    cropped = region_of_interest(canny)
+    
+    # Use higher threshold for Hough lines to avoid rain-streak 'lines'
+    lines = cv2.HoughLinesP(cropped, 2, np.pi/180, 100, minLineLength=50, maxLineGap=150)
+    
+    left_pts, right_pts = [], []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            slope = (y2 - y1) / (x2 - x1) if x2 != x1 else 0
+            if -2.0 < slope < -0.5: left_pts.extend([(x1, y1), (x2, y2)])
+            elif 0.5 < slope < 2.0: right_pts.extend([(x1, y1), (x2, y2)])
 
-    # Convert to grayscale and apply Canny edge detection
-    gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    cannyed_image = cv2.Canny(gray_image, 100, 200)
+    y_min, y_max = 450, HEIGHT
+    # Wrap in try-except or check length to prevent errors when visibility is near zero
+    if len(left_pts) >= 2:
+        xs, ys = zip(*left_pts)
+        p = np.poly1d(np.polyfit(ys, xs, 1))
+        lane_memory.smooth_step([p(y_max), y_max, p(y_min), y_min], True)
+        
+    if len(right_pts) >= 2:
+        xs, ys = zip(*right_pts)
+        p = np.poly1d(np.polyfit(ys, xs, 1))
+        lane_memory.smooth_step([p(y_max), y_max, p(y_min), y_min], False)
 
-    # Mask out the region of interest
-    cropped_image = region_of_interest(
-        cannyed_image,
-        np.array([region_of_interest_vertices], np.int32)
-    )
+    return lane_memory.last_left, lane_memory.last_right
 
-    # Perform Hough Line Transformation to detect lines
-    lines = cv2.HoughLinesP(
-        cropped_image,
-        rho=6,
-        theta=np.pi / 60,
-        threshold=160,
-        lines=np.array([]),
-        minLineLength=40,
-        maxLineGap=25
-    )
-
-    # Separating left and right lines based on slope
-    left_line_x = []
-    left_line_y = []
-    right_line_x = []
-    right_line_y = []
-
-    if lines is None:
-        return image, 0, 0 # Modified to return boundaries for LDW
-
-    for line in lines:
-        for x1, y1, x2, y2 in line:
-            slope = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else 0
-            if math.fabs(slope) < 0.5:  # Ignore nearly horizontal lines
-                continue
-            if slope <= 0:  # Left lane
-                left_line_x.extend([x1, x2])
-                left_line_y.extend([y1, y2])
-            else:  # Right lane
-                right_line_x.extend([x1, x2])
-                right_line_y.extend([y1, y2])
-
-    # Fit a linear polynomial to the left and right lines
-    min_y = int(image.shape[0] * (3 / 5))  # Slightly below the middle of the image
-    max_y = image.shape[0]  # Bottom of the image
-
-    if left_line_x and left_line_y:
-        poly_left = np.poly1d(np.polyfit(left_line_y, left_line_x, deg=1))
-        left_x_start = int(poly_left(max_y))
-        left_x_end = int(poly_left(min_y))
-    else:
-        left_x_start, left_x_end = 0, 0  # Defaults if no lines detected
-
-    if right_line_x and right_line_y:
-        poly_right = np.poly1d(np.polyfit(right_line_y, right_line_x, deg=1))
-        right_x_start = int(poly_right(max_y))
-        right_x_end = int(poly_right(min_y))
-    else:
-        right_x_start, right_x_end = 0, 0  # Defaults if no lines detected
-
-    # Create the filled polygon between the left and right lane lines
-    lane_image = draw_lane_lines(
-        image,
-        [left_x_start, max_y, left_x_end, min_y],
-        [right_x_start, max_y, right_x_end, min_y]
-    )
-
-    return lane_image, left_x_start, right_x_start
-
-# Function to estimate distance based on bounding box size
-def estimate_distance(bbox_width, bbox_height):
-    # For simplicity, assume the distance is inversely proportional to the box size
-    focal_length = 1000  # Example focal length, modify based on camera setup
-    known_width = 2.0  # Approximate width of the car (in meters)
-    distance = (known_width * focal_length) / bbox_width  # Basic distance estimation
-    return distance
-
-# Main function to read and process video with YOLOv8
 def process_video():
-    # Load the YOLOv8 model
-    model = YOLO('weights/yolov8n.pt')
-
-    # Open the video file
+    model = YOLO('yolov8n.pt') 
     cap = cv2.VideoCapture('video/car.mp4')
 
-    # Check if video opened successfully
-    if not cap.isOpened():
-        print("Error: Unable to open video file.")
-        return
-
-    # Set the desired frame rate
-    target_fps = 30
-    frame_time = 1.0 / target_fps  # Time per frame to maintain 30fps
-
-    # Resize to 720p (1280x720)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    # Loop through each frame
     while cap.isOpened():
         ret, frame = cap.read()
+        if not ret: break
+        frame = cv2.resize(frame, (WIDTH, HEIGHT))
+        
+        l_line, r_line = pipeline(frame)
+        
+        # YOLOv8 is already quite robust in rain, but we can lower NMS slightly if needed
+        results = model.predict(frame, conf=0.35, classes=[2, 3, 5, 7], verbose=False)
+        
+        collision_detected = False
+        vehicle_boxes = []
 
-        if not ret:
-            break
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            car_x_base, car_y_base = (x1 + x2) / 2, y2 
+            
+            lane_left_limit = get_lane_bounds(car_y_base, l_line)
+            lane_right_limit = get_lane_bounds(car_y_base, r_line)
+            
+            dist = (1.8 * 800) / max((x2 - x1), 1)
+            is_in_my_lane = (lane_left_limit - 15) < car_x_base < (lane_right_limit + 15)
+            
+            is_danger = dist < COLLISION_DIST_THRESHOLD and is_in_my_lane
+            if is_danger: collision_detected = True
+            vehicle_boxes.append(((x1, y1, x2, y2), dist, is_danger))
 
-        # Resize frame to 720p
-        resized_frame = cv2.resize(frame, (1280, 720))
+        frame = draw_lane_overlay(frame, l_line, r_line, collision_detected)
 
-        # Run the lane detection pipeline
-        lane_frame, left_bound, right_bound = pipeline(resized_frame)
+        for (x1, y1, x2, y2), dist, is_danger in vehicle_boxes:
+            color = (0, 0, 255) if is_danger else (0, 255, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{dist:.1f}m", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # --- NEW FEATURE: Lane Departure Warning ---
-        if left_bound != 0 and right_bound != 0:
-            lane_center = (left_bound + right_bound) / 2
-            if abs(640 - lane_center) > 80:
-                cv2.putText(lane_frame, "LANE DEPARTURE WARNING!", (400, 100), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        if collision_detected:
+            cv2.rectangle(frame, (0, 0), (WIDTH, 70), (0, 0, 255), -1)
+            cv2.putText(frame, "!!! WARNING: VEHICLE IN LANE !!!", (WIDTH//4 + 50, 45), 
+                        cv2.FONT_HERSHEY_DUPLEX, 1.2, (255, 255, 255), 3)
 
-        # Run YOLOv8 to detect cars in the current frame
-        results = model(resized_frame)
+        cv2.imshow('Weather-Resistant ADAS', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-        # Process the detections from YOLOv8
-        for result in results:
-            boxes = result.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
-                conf = box.conf[0]  # Confidence score
-                cls = int(box.cls[0])  # Class ID
-                label_name = model.names[cls]
-
-                # --- NEW FEATURE: Traffic Light Logic ---
-                if label_name == 'traffic light' and conf >= 0.5:
-                    state, color_code = detect_traffic_light_state(resized_frame, (x1, y1, x2, y2))
-                    cv2.rectangle(lane_frame, (x1, y1), (x2, y2), color_code, 2)
-                    cv2.putText(lane_frame, f"LIGHT: {state}", (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_code, 2)
-
-                # --- UPGRADED FEATURE: Car, Truck, and Pedestrian detection ---
-                if label_name in ['car', 'truck', 'person'] and conf >= 0.5:
-                    label = f'{label_name} {conf:.2f}'
-
-                    # Estimate the distance
-                    bbox_width = x2 - x1
-                    bbox_height = y2 - y1
-                    distance = estimate_distance(bbox_width, bbox_height)
-
-                    # --- NEW FEATURE: Collision Alert ---
-                    box_color = (0, 255, 255) # Yellow
-                    if left_bound < (x1 + x2)/2 < right_bound and distance < 8:
-                        box_color = (0, 0, 255) # Red
-                        cv2.putText(lane_frame, "COLLISION ALERT!", (x1, y1 - 30), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-                    # Draw the bounding box
-                    cv2.rectangle(lane_frame, (x1, y1), (x2, y2), box_color, 2)
-                    cv2.putText(lane_frame, label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-
-                    # Display the estimated distance
-                    distance_label = f'Distance: {distance:.2f}m'
-                    cv2.putText(lane_frame, distance_label, (x1, y2 + 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-        # Display the resulting frame with both lane detection and car detection
-        cv2.imshow('Lane and Car Detection', lane_frame)
-
-        # Limit the frame rate to 30fps
-        time.sleep(frame_time)
-
-        # Break the loop when 'q' is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    # Release video capture and close windows
     cap.release()
     cv2.destroyAllWindows()
 
-# Run the video processing function
-process_video()
+if __name__ == "__main__":
+    process_video()
