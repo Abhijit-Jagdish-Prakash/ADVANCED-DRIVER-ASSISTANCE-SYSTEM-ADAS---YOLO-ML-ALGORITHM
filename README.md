@@ -89,4 +89,4 @@ python main.py
 
 ## 📝 License
 
-Distributed under the GNU License. See `LICENSE` for more information.
+Distributed under the GPL License. See `LICENSE` for more information.
