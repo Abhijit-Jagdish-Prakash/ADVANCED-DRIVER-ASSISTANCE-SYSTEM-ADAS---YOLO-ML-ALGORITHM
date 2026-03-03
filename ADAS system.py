@@ -33,19 +33,23 @@ def region_of_interest(img):
     return cv2.bitwise_and(img, mask)
 
 def preprocess_for_weather(img):
-    """Enhances visibility for fog and rain conditions."""
-    # 1. Convert to HLS to isolate yellow/white lanes better than Grayscale
-    hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
-    l_channel = hls[:,:,1]
+    """Enhanced visibility for fog and rain while keeping your original logic flow."""
+    # 1. Lab Color Space: L-channel is more stable than HLS in gray/wet weather
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
+    l_channel, a, b = cv2.split(lab)
     
-    # 2. Apply CLAHE to the L (Lightness) channel to 'see' through fog
+    # 2. Apply CLAHE to handle fog/glare
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     enhanced_l = clahe.apply(l_channel)
     
-    # 3. Bilateral Filter: Smooths rain noise while keeping lane edges sharp
-    blurred = cv2.bilateralFilter(enhanced_l, 9, 75, 75)
+    # 3. Morphological Opening: Removes small rain-drop noise 
+    kernel = np.ones((3,3), np.uint8)
+    opening = cv2.morphologyEx(enhanced_l, cv2.MORPH_OPEN, kernel)
     
-    # 4. Adaptive Canny
+    # 4. Bilateral Filter: Keeps lane edges sharp while smoothing noise
+    blurred = cv2.bilateralFilter(opening, 9, 75, 75)
+    
+    # 5. Your Original Adaptive Canny Logic
     v = np.median(blurred)
     lower = int(max(0, (1.0 - 0.33) * v))
     upper = int(min(255, (1.0 + 0.33) * v))
@@ -62,11 +66,10 @@ def draw_lane_overlay(img, left_line, right_line, is_danger):
     return cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
 
 def pipeline(image):
-    # Process image with weather-resistant enhancements
     canny = preprocess_for_weather(image)
     cropped = region_of_interest(canny)
     
-    # Use higher threshold for Hough lines to avoid rain-streak 'lines'
+    # Using your original HoughLinesP parameters
     lines = cv2.HoughLinesP(cropped, 2, np.pi/180, 100, minLineLength=50, maxLineGap=150)
     
     left_pts, right_pts = [], []
@@ -78,16 +81,22 @@ def pipeline(image):
             elif 0.5 < slope < 2.0: right_pts.extend([(x1, y1), (x2, y2)])
 
     y_min, y_max = 450, HEIGHT
-    # Wrap in try-except or check length to prevent errors when visibility is near zero
+    
+    # Fit Left Line with your original poly1d logic
     if len(left_pts) >= 2:
-        xs, ys = zip(*left_pts)
-        p = np.poly1d(np.polyfit(ys, xs, 1))
-        lane_memory.smooth_step([p(y_max), y_max, p(y_min), y_min], True)
+        try:
+            xs, ys = zip(*left_pts)
+            p = np.poly1d(np.polyfit(ys, xs, 1))
+            lane_memory.smooth_step([p(y_max), y_max, p(y_min), y_min], True)
+        except: pass # Safety for singular matrix errors
         
+    # Fit Right Line with your original poly1d logic
     if len(right_pts) >= 2:
-        xs, ys = zip(*right_pts)
-        p = np.poly1d(np.polyfit(ys, xs, 1))
-        lane_memory.smooth_step([p(y_max), y_max, p(y_min), y_min], False)
+        try:
+            xs, ys = zip(*right_pts)
+            p = np.poly1d(np.polyfit(ys, xs, 1))
+            lane_memory.smooth_step([p(y_max), y_max, p(y_min), y_min], False)
+        except: pass
 
     return lane_memory.last_left, lane_memory.last_right
 
@@ -102,7 +111,6 @@ def process_video():
         
         l_line, r_line = pipeline(frame)
         
-        # YOLOv8 is already quite robust in rain, but we can lower NMS slightly if needed
         results = model.predict(frame, conf=0.35, classes=[2, 3, 5, 7], verbose=False)
         
         collision_detected = False
@@ -115,6 +123,7 @@ def process_video():
             lane_left_limit = get_lane_bounds(car_y_base, l_line)
             lane_right_limit = get_lane_bounds(car_y_base, r_line)
             
+            # Your original distance formula
             dist = (1.8 * 800) / max((x2 - x1), 1)
             is_in_my_lane = (lane_left_limit - 15) < car_x_base < (lane_right_limit + 15)
             
@@ -131,7 +140,7 @@ def process_video():
 
         if collision_detected:
             cv2.rectangle(frame, (0, 0), (WIDTH, 70), (0, 0, 255), -1)
-            cv2.putText(frame, "!!! WARNING: VEHICLE IN LANE !!!", (WIDTH//4 + 50, 45), 
+            cv2.putText(frame, "!!! COLLSION WARNING: VEHICLE IN LANE !!!", (WIDTH//4 + 50, 45), 
                         cv2.FONT_HERSHEY_DUPLEX, 1.2, (255, 255, 255), 3)
 
         cv2.imshow('Weather-Resistant ADAS', frame)
@@ -142,4 +151,3 @@ def process_video():
 
 if __name__ == "__main__":
     process_video()
-
