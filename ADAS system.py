@@ -140,7 +140,7 @@ def process_video():
 
         if collision_detected:
             cv2.rectangle(frame, (0, 0), (WIDTH, 70), (0, 0, 255), -1)
-            cv2.putText(frame, "!!! COLISSION WARNING: VEHICLE IN LANE !!!", (WIDTH//4 + 50, 45), 
+            cv2.putText(frame, "!!! COLLISION WARNING: VEHICLE IN LANE !!!", (WIDTH//4 + 50, 45), 
                         cv2.FONT_HERSHEY_DUPLEX, 1.2, (255, 255, 255), 3)
 
         cv2.imshow('Weather-Resistant ADAS', frame)
